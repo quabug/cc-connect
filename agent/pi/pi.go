@@ -1,12 +1,15 @@
 package pi
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -23,6 +26,7 @@ type Agent struct {
 	workDir    string
 	model      string
 	mode       string // "default" | "yolo"
+	thinking   string // reasoning effort: off, minimal, low, medium, high, xhigh
 	sessionEnv []string
 	mu         sync.Mutex
 }
@@ -96,11 +100,77 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	extraEnv := append([]string{}, a.sessionEnv...)
 	a.mu.Unlock()
 
-	return newPiSession(ctx, a.cmd, a.workDir, model, mode, sessionID, extraEnv)
+	thinking := a.thinking
+	return newPiSession(ctx, a.cmd, a.workDir, model, mode, thinking, sessionID, extraEnv)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
-	return nil, nil
+	sessDir := piSessionDir(a.workDir)
+	if sessDir == "" {
+		return nil, nil
+	}
+
+	entries, err := os.ReadDir(sessDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("pi: read session dir: %w", err)
+	}
+
+	var sessions []core.AgentSessionInfo
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		sessionID, summary, msgCount := scanPiSession(filepath.Join(sessDir, name))
+		if sessionID == "" {
+			continue
+		}
+
+		sessions = append(sessions, core.AgentSessionInfo{
+			ID:           sessionID,
+			Summary:      summary,
+			MessageCount: msgCount,
+			ModifiedAt:   info.ModTime(),
+		})
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].ModifiedAt.After(sessions[j].ModifiedAt)
+	})
+
+	return sessions, nil
+}
+
+func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
+	sessDir := piSessionDir(a.workDir)
+	if sessDir == "" {
+		return fmt.Errorf("pi: cannot determine session directory")
+	}
+
+	entries, err := os.ReadDir(sessDir)
+	if err != nil {
+		return fmt.Errorf("pi: read session dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		// Session files are named: <timestamp>_<uuid>.jsonl
+		if strings.Contains(entry.Name(), sessionID) {
+			return os.Remove(filepath.Join(sessDir, entry.Name()))
+		}
+	}
+	return fmt.Errorf("pi: session %q not found", sessionID)
 }
 
 func (a *Agent) Stop() error { return nil }
@@ -143,4 +213,191 @@ func (a *Agent) GlobalMemoryFile() string {
 		return ""
 	}
 	return filepath.Join(homeDir, ".pi", "AGENTS.md")
+}
+
+// ── ReasoningEffortSwitcher ──────────────────────────────────
+
+func (a *Agent) SetReasoningEffort(effort string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.thinking = effort
+	slog.Info("pi: thinking level changed", "level", effort)
+}
+
+func (a *Agent) GetReasoningEffort() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.thinking
+}
+
+func (a *Agent) AvailableReasoningEfforts() []string {
+	return []string{"off", "minimal", "low", "medium", "high", "xhigh"}
+}
+
+// ── GetWorkDir (for /status display) ─────────────────────────
+
+func (a *Agent) GetWorkDir() string { return a.workDir }
+
+// ── HistoryProvider ──────────────────────────────────────────
+
+func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
+	sessDir := piSessionDir(a.workDir)
+	if sessDir == "" {
+		return nil, nil
+	}
+
+	// Find the session file containing this ID.
+	entries, err := os.ReadDir(sessDir)
+	if err != nil {
+		return nil, nil
+	}
+
+	var sessFile string
+	for _, e := range entries {
+		if strings.Contains(e.Name(), sessionID) {
+			sessFile = filepath.Join(sessDir, e.Name())
+			break
+		}
+	}
+	if sessFile == "" {
+		return nil, nil
+	}
+
+	return readPiHistory(sessFile, limit)
+}
+
+// ── SkillProvider ────────────────────────────────────────────
+
+func (a *Agent) SkillDirs() []string {
+	absDir, err := filepath.Abs(a.workDir)
+	if err != nil {
+		absDir = a.workDir
+	}
+	dirs := []string{filepath.Join(absDir, ".pi", "skills")}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".pi", "skills"))
+	}
+	return dirs
+}
+
+// ── Session helpers ──────────────────────────────────────────
+
+// piSessionDir returns the pi session directory for the given workDir.
+// Pi encodes the absolute path as: replace "/" with "-", wrap with "--".
+// e.g. /home/user/project → --home-user-project--
+func piSessionDir(workDir string) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	absDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return ""
+	}
+	encoded := "--" + strings.ReplaceAll(strings.TrimPrefix(absDir, "/"), "/", "-") + "--"
+	return filepath.Join(homeDir, ".pi", "agent", "sessions", encoded)
+}
+
+// scanPiSession reads a pi session .jsonl file and extracts the session ID,
+// a summary (first user message), and a message count.
+func scanPiSession(path string) (sessionID, summary string, msgCount int) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1*1024*1024)
+
+	for scanner.Scan() {
+		var entry map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		switch entry["type"] {
+		case "session":
+			if id, ok := entry["id"].(string); ok {
+				sessionID = id
+			}
+		case "message":
+			msg, _ := entry["message"].(map[string]any)
+			if msg == nil {
+				continue
+			}
+			role, _ := msg["role"].(string)
+			if role == "user" || role == "assistant" {
+				msgCount++
+			}
+			// Use first user message as summary.
+			if role == "user" && summary == "" {
+				content, _ := msg["content"].([]any)
+				for _, c := range content {
+					item, _ := c.(map[string]any)
+					if item != nil {
+						if text, ok := item["text"].(string); ok && text != "" {
+							summary = text
+							if len(summary) > 80 {
+								summary = summary[:80] + "..."
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	return
+}
+
+// readPiHistory reads user/assistant messages from a pi session file.
+func readPiHistory(path string, limit int) ([]core.HistoryEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1*1024*1024)
+
+	var all []core.HistoryEntry
+	for scanner.Scan() {
+		var entry map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if entry["type"] != "message" {
+			continue
+		}
+		msg, _ := entry["message"].(map[string]any)
+		if msg == nil {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "user" && role != "assistant" {
+			continue
+		}
+
+		var text string
+		content, _ := msg["content"].([]any)
+		for _, c := range content {
+			item, _ := c.(map[string]any)
+			if item != nil {
+				if t, ok := item["text"].(string); ok && t != "" {
+					text = t
+					break
+				}
+			}
+		}
+		if text == "" {
+			continue
+		}
+		all = append(all, core.HistoryEntry{Role: role, Content: text})
+	}
+
+	if limit > 0 && len(all) > limit {
+		all = all[len(all)-limit:]
+	}
+	return all, nil
 }
