@@ -363,6 +363,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 				return
 			}
 			m.Content = stripDiscordMentionWithRole(m.Content, p.botID, botRoleID)
+			if m.MentionEveryone {
+				m.Content = stripEveryoneHere(m.Content)
+			}
 		}
 
 		slog.Debug("discord: message received", "user", m.Author.Username, "channel", m.ChannelID)
@@ -796,6 +799,13 @@ func stripDiscordMentionWithRole(text, botID string, botRoleID string) string {
 	if botRoleID != "" {
 		text = strings.ReplaceAll(text, "<@&"+botRoleID+">", "")
 	}
+	return strings.TrimSpace(text)
+}
+
+// stripEveryoneHere removes @everyone and @here from text.
+func stripEveryoneHere(text string) string {
+	text = strings.ReplaceAll(text, "@everyone", "")
+	text = strings.ReplaceAll(text, "@here", "")
 	return strings.TrimSpace(text)
 }
 
