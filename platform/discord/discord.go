@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/gorilla/websocket"
 )
 
 func init() {
@@ -47,6 +49,7 @@ type Platform struct {
 	shareSessionInChannel      bool
 	threadIsolation            bool
 	respondToAtEveryoneAndHere bool
+	proxyURL                   *url.URL
 	session                    *discordgo.Session
 	handler                    core.MessageHandler
 	botID                      string
@@ -70,6 +73,20 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
+
+	var proxyU *url.URL
+	if proxyStr, _ := opts["proxy"].(string); proxyStr != "" {
+		u, err := url.Parse(proxyStr)
+		if err != nil {
+			return nil, fmt.Errorf("discord: invalid proxy URL %q: %w", proxyStr, err)
+		}
+		if user, _ := opts["proxy_username"].(string); user != "" {
+			pass, _ := opts["proxy_password"].(string)
+			u.User = url.UserPassword(user, pass)
+		}
+		proxyU = u
+	}
+
 	return &Platform{
 		token:                      token,
 		allowFrom:                  allowFrom,
@@ -79,6 +96,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		readyCh:                    make(chan struct{}),
 		threadIsolation:            threadIsolation,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
+		proxyURL:                   proxyU,
 	}, nil
 }
 
@@ -408,6 +426,12 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	session, err := discordgo.New("Bot " + p.token)
 	if err != nil {
 		return fmt.Errorf("discord: create session: %w", err)
+	}
+	if p.proxyURL != nil {
+		transport := &http.Transport{Proxy: http.ProxyURL(p.proxyURL)}
+		session.Client = &http.Client{Transport: transport, Timeout: 60 * time.Second}
+		session.Dialer = &websocket.Dialer{Proxy: http.ProxyURL(p.proxyURL)}
+		slog.Info("discord: using proxy", "proxy", p.proxyURL.Host)
 	}
 	p.session = session
 
